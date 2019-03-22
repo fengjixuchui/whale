@@ -39,8 +39,8 @@ bool ArtRuntime::OnLoad(JavaVM *vm, JNIEnv *env, jclass java_class) {
     if ((kRuntimeISA == InstructionSet::kArm
          || kRuntimeISA == InstructionSet::kArm64)
         && IsFileInMemory("libhoudini.so")) {
-        LOG(INFO) << '[' << getpid() << ']' << " You are running on houdini environment.";
-        is_houdini_ = true;
+        LOG(INFO) << '[' << getpid() << ']' << " Unable to launch on houdini environment.";
+        return false;
     }
     vm_ = vm;
     java_class_ = reinterpret_cast<jclass>(env->NewGlobalRef(java_class));
@@ -55,10 +55,7 @@ bool ArtRuntime::OnLoad(JavaVM *vm, JNIEnv *env, jclass java_class) {
     api_level_ = GetAndroidApiLevel();
     PreLoadRequiredStuff(env);
     const char *art_path = kLibArtPath;
-    if (is_houdini_) {
-        art_path = kLibHoudiniArtPath;
-    }
-    art_elf_image_ = WDynamicLibOpenAlias("/libart.so", art_path);
+    art_elf_image_ = WDynamicLibOpen(art_path);
     if (art_elf_image_ == nullptr) {
         LOG(ERROR) << "Unable to read data from libart.so.";
         return false;
@@ -297,15 +294,30 @@ ArtRuntime::InvokeOriginalMethod(jlong slot, jobject this_object, jobjectArray a
     return ret;
 }
 
+#if defined(__aarch64__)
+# define __get_tls() ({ void** __val; __asm__("mrs %0, tpidr_el0" : "=r"(__val)); __val; })
+#elif defined(__arm__)
+# define __get_tls() ({ void** __val; __asm__("mrc p15, 0, %0, c13, c0, 3" : "=r"(__val)); __val; })
+#elif defined(__i386__)
+# define __get_tls() ({ void** __val; __asm__("movl %%gs:0, %0" : "=r"(__val)); __val; })
+#elif defined(__x86_64__)
+# define __get_tls() ({ void** __val; __asm__("mov %%fs:0, %0" : "=r"(__val)); __val; })
+#else
+#error unsupported architecture
+#endif
+
 ArtThread *ArtRuntime::GetCurrentArtThread() {
-    JNIEnv *env = GetJniEnv();
-    jobject current = env->CallStaticObjectMethod(
-            WellKnownClasses::java_lang_Thread,
-            WellKnownClasses::java_lang_Thread_currentThread
-    );
-    return reinterpret_cast<ArtThread *>(
-            env->GetLongField(current, WellKnownClasses::java_lang_Thread_nativePeer)
-    );
+    if (WellKnownClasses::java_lang_Thread_nativePeer) {
+        JNIEnv *env = GetJniEnv();
+        jobject current = env->CallStaticObjectMethod(
+                WellKnownClasses::java_lang_Thread,
+                WellKnownClasses::java_lang_Thread_currentThread
+        );
+        return reinterpret_cast<ArtThread *>(
+                env->GetLongField(current, WellKnownClasses::java_lang_Thread_nativePeer)
+        );
+    }
+    return reinterpret_cast<ArtThread *>(__get_tls()[7/*TLS_SLOT_ART_THREAD_SELF*/]);
 }
 
 jobject
@@ -446,6 +458,9 @@ ptr_t ArtRuntime::CloneArtObject(ptr_t art_object) {
     ResolvedSymbols *symbols = GetSymbols();
     if (symbols->Object_Clone) {
         return symbols->Object_Clone(art_object, GetCurrentArtThread());
+    }
+    if (symbols->Object_CloneWithClass) {
+        return symbols->Object_CloneWithClass(art_object, GetCurrentArtThread(), nullptr);
     }
     return symbols->Object_CloneWithSize(art_object, GetCurrentArtThread(), 0);
 }
